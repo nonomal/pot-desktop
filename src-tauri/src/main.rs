@@ -1,221 +1,155 @@
-#![cfg_attr(
-    all(not(debug_assertions), target_os = "windows"),
-    windows_subsystem = "windows"
-)]
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod backup;
+mod clipboard;
+mod cmd;
 mod config;
-mod shortcut;
-mod trayicon;
-mod utils;
+mod error;
+mod hotkey;
+mod lang_detect;
+mod screenshot;
+mod server;
+mod system_ocr;
+mod tray;
+mod updater;
 mod window;
 
+use backup::*;
+use clipboard::*;
+use cmd::*;
 use config::*;
+use hotkey::*;
+use lang_detect::*;
+use log::info;
 use once_cell::sync::OnceCell;
-use shortcut::register_shortcut;
+use screenshot::screenshot;
+use server::*;
 use std::sync::Mutex;
+use system_ocr::*;
 use tauri::api::notification::Notification;
-use tauri::AppHandle;
 use tauri::Manager;
-use tauri::SystemTrayEvent;
-use tauri_plugin_autostart::MacosLauncher;
-use trayicon::*;
-use utils::*;
-use window::*;
+use tauri_plugin_log::LogTarget;
+use tray::*;
+use updater::check_update;
+use window::config_window;
+use window::updater_window;
 
-#[cfg(target_os = "macos")]
-fn query_accessibility_permissions() -> bool {
-    let trusted = macos_accessibility_client::accessibility::application_is_trusted_with_prompt();
-    if trusted {
-        print!("Application is totally trusted!");
-    } else {
-        print!("Application isn't trusted :(");
-    }
-    trusted
-}
+// Global AppHandle
+pub static APP: OnceCell<tauri::AppHandle> = OnceCell::new();
 
-// 全局AppHandle
-pub static APP: OnceCell<AppHandle> = OnceCell::new();
-// 存待翻译文本
+// Text to be translated
 pub struct StringWrapper(pub Mutex<String>);
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    if !query_accessibility_permissions() {
-        return;
-    }
-
-    // 修复WebKitGTK的渲染问题 https://github.com/tauri-apps/tauri/issues/5143
-    #[cfg(not(target_os = "windows"))]
-    std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
-
     tauri::Builder::default()
-        // 单例运行
-        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
-            if argv.contains(&"popclip".to_string()) {
-                popclip_window(argv.last().unwrap().to_owned());
-            } else if argv.contains(&"translate".to_string()) {
-                translate_window();
-            } else if argv.contains(&"persistent".to_string()) {
-                persistent_window();
-            } else if argv.contains(&"screenshot_ocr".to_string()) {
-                screenshot_ocr_window();
-            } else if argv.contains(&"screenshot_translate".to_string()) {
-                screenshot_translate_window();
-            } else {
-                Notification::new(&app.config().tauri.bundle.identifier)
-                    .title("程序已经在运行 请勿重复启动！")
-                    .body(cwd)
-                    .icon("pot")
-                    .show()
-                    .unwrap();
-            }
+        .plugin(tauri_plugin_single_instance::init(|app, _, cwd| {
+            Notification::new(&app.config().tauri.bundle.identifier)
+                .title("The program is already running. Please do not start it again!")
+                .body(cwd)
+                .icon("pot")
+                .show()
+                .unwrap();
         }))
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .targets([LogTarget::LogDir, LogTarget::Stdout])
+                .build(),
+        )
         .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
-        //加载托盘图标
-        .system_tray(build_system_tray())
+        .plugin(tauri_plugin_sql::Builder::default().build())
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_fs_watch::init())
+        .system_tray(tauri::SystemTray::new())
         .setup(|app| {
+            info!("============== Start App ==============");
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            // 初始化AppHandel
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                let trusted =
+                    macos_accessibility_client::accessibility::application_is_trusted_with_prompt();
+                info!("MacOS Accessibility Trusted: {}", trusted);
+            }
+            // Global AppHandle
             APP.get_or_init(|| app.handle());
-            let app_handle = APP.get().unwrap();
-            // 初始化设置
-            let is_first = !Config::init_config();
-            // 初始化翻译内容
-            app_handle.manage(StringWrapper(Mutex::new("".to_string())));
-            // 创建驻留窗口，防止后续创建窗口时闪烁
-            create_background_window();
-            // 首次启动打开设置页面
-            if is_first {
-                on_config_click(app_handle);
+            // Init Config
+            info!("Init Config Store");
+            init_config(app);
+            // Check First Run
+            if is_first_run() {
+                // Open Config Window
+                info!("First Run, opening config window");
+                config_window();
             }
-            use std::thread;
-            use tiny_http::{Response, Server};
-            thread::spawn(move || {
-                let server = Server::http("127.0.0.1:60828").unwrap();
-                for mut request in server.incoming_requests() {
-                    let mut content = String::new();
-                    request.as_reader().read_to_string(&mut content).unwrap();
-                    popclip_window(content);
-                    let response = Response::from_string("success");
-                    request.respond(response).unwrap();
-                }
-            });
-            // 注册全局快捷键
+            app.manage(StringWrapper(Mutex::new("".to_string())));
+            // Update Tray Menu
+            update_tray(app.app_handle(), "".to_string(), "".to_string());
+            // Start http server
+            start_server();
+            // Register Global Shortcut
             match register_shortcut("all") {
-                Ok(_) => {}
-                Err(e) => {
-                    Notification::new(&app.config().tauri.bundle.identifier)
-                        .title("快捷键注册失败")
-                        .body(e)
-                        .icon("pot")
-                        .show()
-                        .unwrap();
+                Ok(()) => {}
+                Err(e) => Notification::new(app.config().tauri.bundle.identifier.clone())
+                    .title("Failed to register global shortcut")
+                    .body(&e)
+                    .icon("pot")
+                    .show()
+                    .unwrap(),
+            }
+            match get("proxy_enable") {
+                Some(v) => {
+                    if v.as_bool().unwrap() && get("proxy_host").map_or(false, |host| !host.as_str().unwrap().is_empty()) {
+                        let _ = set_proxy();
+                    }
+                }
+                None => {}
+            }
+            // Check Update
+            check_update(app.handle());
+            if let Some(engine) = get("translate_detect_engine") {
+                if engine.as_str().unwrap() == "local" {
+                    init_lang_detect();
                 }
             }
-            let copy_mode = get_config("auto_copy", toml::Value::Integer(4), app_handle.state())
-                .as_integer()
-                .unwrap();
-            update_tray(app_handle, copy_mode);
-            // 设置代理
-            let proxy = get_config(
-                "proxy",
-                toml::Value::String(String::from("")),
-                app_handle.state(),
-            );
-            set_proxy(proxy.as_str().unwrap()).unwrap();
-            // 检查更新
-            let enable = get_config("auto_check", toml::Value::Boolean(true), app_handle.state());
-            let handle = app.handle();
-
-            if enable.as_bool().unwrap() {
-                tauri::async_runtime::spawn(async move {
-                    match tauri::updater::builder(handle).check().await {
-                        Ok(update) => {
-                            if update.is_update_available() {
-                                let window = app_handle.get_window("util").unwrap();
-                                let update_ = update.clone();
-                                tauri::api::dialog::ask(
-                                    Some(&window),
-                                    "新版本可用,是否更新？",
-                                    update.body().unwrap(),
-                                    |isok| {
-                                        if isok {
-                                            let app_handle = app_handle.clone();
-                                            Notification::new(
-                                                &app_handle.config().tauri.bundle.identifier,
-                                            )
-                                            .title("正在下载更新，请耐心等待")
-                                            .icon("pot")
-                                            .show()
-                                            .unwrap();
-                                            tauri::async_runtime::block_on(async move {
-                                                match update_.download_and_install().await {
-                                                    Ok(_) => {}
-                                                    Err(e) => {
-                                                        Notification::new(
-                                                            &app_handle
-                                                                .config()
-                                                                .tauri
-                                                                .bundle
-                                                                .identifier,
-                                                        )
-                                                        .title("更新出错")
-                                                        .body(e.to_string())
-                                                        .icon("pot")
-                                                        .show()
-                                                        .unwrap();
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    },
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            println!("failed to get update: {}", e);
-                        }
-                    }
-                });
-            }
+            let clipboard_monitor = match get("clipboard_monitor") {
+                Some(v) => v.as_bool().unwrap(),
+                None => {
+                    set("clipboard_monitor", false);
+                    false
+                }
+            };
+            app.manage(ClipboardMonitorEnableWrapper(Mutex::new(
+                clipboard_monitor.to_string(),
+            )));
+            start_clipboard_monitor(app.handle());
             Ok(())
         })
-        // 注册Tauri Command
         .invoke_handler(tauri::generate_handler![
-            get_translate_text,
-            get_config_str,
-            set_config,
-            write_config,
+            reload_store,
+            get_text,
+            cut_image,
+            get_base64,
+            copy_img,
+            system_ocr,
             set_proxy,
-            is_macos,
-            is_linux,
-            is_wayland,
+            unset_proxy,
+            run_binary,
+            open_devtools,
+            register_shortcut_by_frontend,
+            update_tray,
+            updater_window,
             screenshot,
-            cut_screenshot,
-            print,
-            get_base64
+            lang_detect,
+            webdav,
+            local,
+            install_plugin,
+            font_list,
+            aliyun
         ])
-        //绑定托盘事件
-        .on_system_tray_event(|app, event| match event {
-            SystemTrayEvent::LeftClick { .. } => on_tray_click(app),
-            SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
-                PERSISTENT_WINDOW => on_persistent_click(),
-                CONFIG_TRAY_ITEM => on_config_click(app),
-                QUIT_TRAY_ITEM => on_quit_click(),
-                OCR_WINDOW => on_ocr_click(),
-                SCREENSHOT_TRANSLATE => on_screenshot_translate_click(),
-                COPY_SOURCE => on_auto_copy_click(app, 1),
-                COPY_TARGET => on_auto_copy_click(app, 2),
-                COPY_SOURCE_TARGET => on_auto_copy_click(app, 3),
-                COPY_CLOSE => on_auto_copy_click(app, 4),
-                _ => {}
-            },
-            _ => {}
-        })
+        .on_system_tray_event(tray_event_handler)
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         // 窗口关闭不退出

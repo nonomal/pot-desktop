@@ -1,171 +1,188 @@
-use crate::shortcut::register_shortcut;
-use crate::trayicon::update_tray;
-use crate::APP;
+use crate::{error::Error, APP};
 use dirs::config_dir;
+use log::{info, warn};
+use serde_json::{json, Value};
 use std::sync::Mutex;
-use std::{fs, io::Read, path::PathBuf};
-use tauri::api::notification::Notification;
-use tauri::utils::platform::current_exe;
-use tauri::{GlobalShortcutManager, Manager};
-use toml::{Table, Value};
+use tauri::{Manager, Wry};
+use tauri_plugin_store::{Store, StoreBuilder};
 
-fn get_app_config_dir() -> PathBuf {
-    let handle = APP.get().unwrap();
-    let mut app_config_dir_path = config_dir().expect("Get Config Dir Failed");
-    app_config_dir_path.push(&handle.config().tauri.bundle.identifier);
-    app_config_dir_path
-}
+pub struct StoreWrapper(pub Mutex<Store<Wry>>);
 
-fn get_app_config_file() -> PathBuf {
-    let exe_path = current_exe().expect("Get Exe Path Failed");
-    let exe_dir_path = exe_path.parent().expect("Get Exe Dir Failed");
-    let mut exe_config_path = exe_dir_path.to_path_buf();
-    exe_config_path = dunce::canonicalize(exe_config_path).unwrap();
-    exe_config_path.push("config.toml");
+pub fn init_config(app: &mut tauri::App) {
+    let config_path = config_dir().unwrap();
+    let config_path = config_path.join(app.config().tauri.bundle.identifier.clone());
+    let config_path = config_path.join("config.json");
+    info!("Load config from: {:?}", config_path);
+    let mut store = StoreBuilder::new(app.handle(), config_path).build();
 
-    if exe_config_path.exists() {
-        return exe_config_path;
-    }
-    let mut app_config_file_path = get_app_config_dir();
-    app_config_file_path.push("config.toml");
-    app_config_file_path
-}
-
-fn check_config() -> bool {
-    // 配置目录路径
-    let app_config_dir_path = get_app_config_dir();
-    // 配置文件路径
-    let app_config_file_path = get_app_config_file();
-
-    if !app_config_file_path.exists() {
-        if !app_config_dir_path.exists() {
-            // 创建目录
-            fs::create_dir_all(app_config_dir_path).expect("Create Config Dir Failed");
-        }
-        // 创建文件
-        fs::File::create(app_config_file_path).expect("Create Config File Failed");
-        return false;
-    }
-    true
-}
-
-pub struct ConfigWrapper(pub Mutex<Config>);
-// 配置文件结构体
-pub struct Config {
-    pub config_toml: Table,
-}
-
-impl Config {
-    pub fn init_config() -> bool {
-        // 配置文件路径
-        let app_config_file_path = get_app_config_file();
-        // 检查配置文件
-        let flag = check_config();
-        // 读取配置文件
-        let mut config_file =
-            fs::File::open(app_config_file_path).expect("Open Config File Failed");
-        let mut contents = String::new();
-        config_file
-            .read_to_string(&mut contents)
-            .expect("Read Config File Failed");
-        // 构造配置结构体
-        let config = ConfigWrapper(Mutex::new(Config {
-            config_toml: contents.parse::<Table>().expect("Parse Config File Failed"),
-        }));
-        // 写入状态
-        APP.get().unwrap().manage(config);
-        flag
-    }
-    pub fn get(&self, key: &str, default: Value) -> Value {
-        match self.config_toml.get(key) {
-            Some(v) => v.to_owned(),
-            None => default,
+    match store.load() {
+        Ok(_) => info!("Config loaded"),
+        Err(e) => {
+            warn!("Config load error: {:?}", e);
+            info!("Config not found, creating new config");
         }
     }
-    pub fn set(&mut self, key: &str, value: Value) {
-        self.config_toml.insert(key.to_string(), value);
-    }
-    pub fn write(&self) -> Result<(), String> {
-        let app_config_file_path = get_app_config_file();
-        let contents = self.config_toml.to_string();
-        match fs::write(app_config_file_path, contents) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.to_string()),
-        }
-    }
+    app.manage(StoreWrapper(Mutex::new(store)));
+    let _ = check_service_available();
 }
 
-pub fn get_config(key: &str, default: Value, state: tauri::State<ConfigWrapper>) -> Value {
-    state.0.lock().unwrap().get(key, default)
-}
-
-#[tauri::command]
-pub fn set_config(key: &str, value: Value, state: tauri::State<ConfigWrapper>) {
-    if key == "auto_copy" {
-        let copy_mode = value.as_integer().unwrap();
-        update_tray(APP.get().unwrap(), copy_mode);
-    }
-    if key.starts_with("shortcut") {
-        let handle = APP.get().unwrap();
-        let old_shortcut = get_config(key, Value::from(""), APP.get().unwrap().state());
-        handle
-            .global_shortcut_manager()
-            .unregister(old_shortcut.as_str().unwrap())
-            .unwrap();
-        state.0.lock().unwrap().set(key, value);
-        match register_shortcut(key) {
-            Ok(_) => {
-                Notification::new(&handle.config().tauri.bundle.identifier)
-                    .title("快捷键注册成功")
-                    .icon("pot")
-                    .show()
-                    .unwrap();
+fn check_available(list: Vec<String>, builtin: Vec<&str>, plugin: Vec<String>, key: &str) {
+    let origin_length = list.len();
+    let mut new_list = list.clone();
+    for service in list {
+        let name = service.split("@").collect::<Vec<&str>>()[0];
+        let mut is_available = true;
+        if name.starts_with("plugin") {
+            if !plugin.contains(&name.to_string()) {
+                is_available = false;
             }
-            Err(e) => {
-                Notification::new(&handle.config().tauri.bundle.identifier)
-                    .title("快捷键注册失败")
-                    .body(e)
-                    .icon("pot")
-                    .show()
-                    .unwrap();
+        } else {
+            if !builtin.contains(&name) {
+                is_available = false;
             }
         }
-    } else {
-        state.0.lock().unwrap().set(key, value);
-    }
-    if key == "auto_copy" {
-        let _ = write_config(state);
-    }
-}
-
-#[tauri::command]
-pub fn write_config(state: tauri::State<ConfigWrapper>) -> Result<(), String> {
-    state.0.lock().unwrap().write()
-}
-
-#[tauri::command]
-pub fn get_config_str(state: tauri::State<ConfigWrapper>) -> Table {
-    return state.0.lock().unwrap().config_toml.clone();
-}
-
-pub fn create_background_window() {
-    let handle = APP.get().unwrap();
-    let _util_window = match handle.get_window("util") {
-        Some(v) => v,
-        None => {
-            tauri::WindowBuilder::new(handle, "util", tauri::WindowUrl::App("index.html".into()))
-                .skip_taskbar(true)
-                .visible(false)
-                .build()
-                .unwrap()
+        if !is_available {
+            new_list.retain(|x| x != &service);
         }
-    };
+    }
+    if new_list.len() != origin_length {
+        set(key, new_list);
+    }
 }
 
-#[tauri::command]
-pub fn set_proxy(proxy: &str) -> Result<(), ()> {
-    std::env::set_var("http_proxy", proxy);
-    std::env::set_var("https_proxy", proxy);
-    std::env::set_var("all_proxy", proxy);
+pub fn check_service_available() -> Result<(), Error> {
+    let builtin_recognize_list: Vec<&str> = vec![
+        "baidu_ocr",
+        "baidu_accurate_ocr",
+        "baidu_img_ocr",
+        "iflytek_ocr",
+        "iflytek_intsig_ocr",
+        "iflytek_latex_ocr",
+        "qrcode",
+        "simple_latex_ocr",
+        "system",
+        "tencent_ocr",
+        "tencent_accurate_ocr",
+        "tencent_img_ocr",
+        "tesseract",
+        "volcengine_ocr",
+        "volcengine_multi_lang_ocr",
+    ];
+    let builtin_translate_list: Vec<&str> = vec![
+        "alibaba",
+        "baidu",
+        "baidu_field",
+        "bing",
+        "bing_dict",
+        "caiyun",
+        "cambridge_dict",
+        "chatglm",
+        "deepl",
+        "ecdict",
+        "lingva",
+        "geminipro",
+        "niutrans",
+        "ollama",
+        "openai",
+        "google",
+        "tencent",
+        "transmart",
+        "volcengine",
+        "yandex",
+        "youdao",
+    ];
+    let builtin_tts_list: Vec<&str> = vec!["lingva_tts"];
+    let builtin_collection_list: Vec<&str> = vec!["anki", "eudic"];
+
+    let plugin_recognize_list: Vec<String> = get_plugin_list("recognize").unwrap_or_default();
+    let plugin_translate_list: Vec<String> = get_plugin_list("translate").unwrap_or_default();
+    let plugin_tts_list: Vec<String> = get_plugin_list("tts").unwrap_or_default();
+    let plugin_collection_list: Vec<String> = get_plugin_list("collection").unwrap_or_default();
+    if let Some(recognize_service_list) = get("recognize_service_list") {
+        let recognize_service_list: Vec<String> = serde_json::from_value(recognize_service_list)?;
+        check_available(
+            recognize_service_list,
+            builtin_recognize_list,
+            plugin_recognize_list,
+            "recognize_service_list",
+        );
+    }
+    if let Some(translate_service_list) = get("translate_service_list") {
+        let translate_service_list: Vec<String> = serde_json::from_value(translate_service_list)?;
+        check_available(
+            translate_service_list,
+            builtin_translate_list,
+            plugin_translate_list,
+            "translate_service_list",
+        );
+    }
+    if let Some(tts_service_list) = get("tts_service_list") {
+        let tts_service_list: Vec<String> = serde_json::from_value(tts_service_list)?;
+        check_available(
+            tts_service_list,
+            builtin_tts_list,
+            plugin_tts_list,
+            "tts_service_list",
+        );
+    }
+    if let Some(collection_service_list) = get("collection_service_list") {
+        let collection_service_list: Vec<String> = serde_json::from_value(collection_service_list)?;
+        check_available(
+            collection_service_list,
+            builtin_collection_list,
+            plugin_collection_list,
+            "collection_service_list",
+        );
+    }
     Ok(())
+}
+
+pub fn get_plugin_list(plugin_type: &str) -> Option<Vec<String>> {
+    let app_handle = APP.get().unwrap();
+    let config_dir = dirs::config_dir()?;
+    let config_dir = config_dir.join(app_handle.config().tauri.bundle.identifier.clone());
+    let plugin_dir = config_dir.join("plugins");
+    let plugin_dir = plugin_dir.join(plugin_type);
+
+    // dirs in plugin_dir
+    let mut plugin_list = vec![];
+    if plugin_dir.exists() {
+        let read_dir = std::fs::read_dir(plugin_dir).ok()?;
+        for entry in read_dir {
+            let entry = entry.ok()?;
+
+            if entry.path().is_dir() {
+                let name = entry.file_name().to_str()?.to_string();
+                if name.starts_with("plugin") {
+                    plugin_list.push(name);
+                } else {
+                    // Remove old plugin
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+    Some(plugin_list)
+}
+
+pub fn get(key: &str) -> Option<Value> {
+    let state = APP.get().unwrap().state::<StoreWrapper>();
+    let store = state.0.lock().unwrap();
+    match store.get(key) {
+        Some(value) => Some(value.clone()),
+        None => None,
+    }
+}
+
+pub fn set<T: serde::ser::Serialize>(key: &str, value: T) {
+    let state = APP.get().unwrap().state::<StoreWrapper>();
+    let mut store = state.0.lock().unwrap();
+    store.insert(key.to_string(), json!(value)).unwrap();
+    store.save().unwrap();
+}
+
+pub fn is_first_run() -> bool {
+    let state = APP.get().unwrap().state::<StoreWrapper>();
+    let store = state.0.lock().unwrap();
+    store.is_empty()
 }

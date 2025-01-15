@@ -1,9 +1,11 @@
-import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { defineConfig } from 'vite';
+import { resolve } from 'path';
 
 // https://vitejs.dev/config/
-export default defineConfig({
+export default defineConfig(async () => ({
     plugins: [react()],
+
     // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
     // prevent vite from obscuring rust errors
     clearScreen: false,
@@ -16,11 +18,17 @@ export default defineConfig({
     // https://tauri.studio/v1/api/config#buildconfig.beforedevcommand
     envPrefix: ['VITE_', 'TAURI_'],
     build: {
+        rollupOptions: {
+            input: {
+                index: resolve(__dirname, 'index.html'),
+                daemon: resolve(__dirname, 'daemon.html'),
+            },
+        },
         // Tauri supports es2021
-        target: process.env.TAURI_PLATFORM == 'windows' ? 'chrome105' : 'safari13',
+        target: process.env.TAURI_PLATFORM == 'windows' ? 'chrome105' : 'safari11',
         // don't minify for debug builds
         minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
         // produce sourcemaps for debug builds
         sourcemap: !!process.env.TAURI_DEBUG,
     },
-});
+}));
